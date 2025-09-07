@@ -1,4 +1,6 @@
 mod app;
+mod audio;
+mod ui;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions::default();

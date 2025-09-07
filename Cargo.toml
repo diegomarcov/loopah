@@ -7,12 +7,19 @@ edition = "2024"
 # UI
 eframe = "0.32"
 egui = "0.32"
+egui_plot = "0.33"
 
 # Native file dialogs
 rfd = "0.15"
 
 # Decode audio (AAC/M4A/MP4, MP3, WAV, FLAC optional)
-symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3", "wav", "flac"] }
+symphonia = { version = "0.5", features = [
+    "aac",
+    "isomp4",
+    "mp3",
+    "wav",
+    "flac",
+] }
 
 # Low-level audio output
 cpal = "0.15"
