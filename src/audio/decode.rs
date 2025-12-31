@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::thread;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -29,8 +32,41 @@ pub struct MemoryAudio {
     pub data: Vec<f32>,
 }
 
-/// Decode once to produce both PCM data and the low-res RMS preview used for drawing.
-pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
+/// Events emitted while decoding in the background.
+#[derive(Debug)]
+pub enum LoadEvent {
+    /// Basic metadata is available; a streaming player can start pulling data.
+    StreamReady { sample_rate: u32, channels: u16 },
+    /// Full preview + PCM finished.
+    PreviewReady {
+        info: DecodedInfo,
+        audio: MemoryAudio,
+    },
+    /// Fatal error during decoding.
+    Error(String),
+}
+
+/// Spawn a background thread that streams PCM chunks while computing the preview.
+pub fn spawn_decode_job(
+    path: PathBuf,
+) -> (mpsc::Receiver<LoadEvent>, mpsc::Receiver<Arc<Vec<f32>>>) {
+    let (event_tx, event_rx) = mpsc::channel();
+    let (pcm_tx, pcm_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        if let Err(err) = decode_streaming(&path, &event_tx, &pcm_tx) {
+            let _ = event_tx.send(LoadEvent::Error(format!("{err:#}")));
+        }
+    });
+
+    (event_rx, pcm_rx)
+}
+
+fn decode_streaming(
+    path: &Path,
+    event_tx: &mpsc::Sender<LoadEvent>,
+    pcm_tx: &mpsc::Sender<Arc<Vec<f32>>>,
+) -> Result<()> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -56,6 +92,11 @@ pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
     let sr = params.sample_rate.context("unknown sample rate")?;
     let chs = params.channels.context("unknown channel count")?.count() as u16;
 
+    event_tx.send(LoadEvent::StreamReady {
+        sample_rate: sr,
+        channels: chs,
+    })?;
+
     let mut decoder = symphonia::default::get_codecs()
         .make(&params, &DecoderOptions::default())
         .context("unsupported codec or failed to build decoder")?;
@@ -65,7 +106,7 @@ pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
     let mut total_frames: u64 = 0;
 
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    let mut out: Vec<f32> = Vec::new();
+    let mut chunk_store: Vec<Arc<Vec<f32>>> = Vec::new();
 
     // Carry RMS accumulation across packets so there's no dropped tail.
     let mut acc_sq = 0.0f64;
@@ -87,11 +128,15 @@ pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
                 let sbuf = sample_buf.as_mut().unwrap();
                 sbuf.copy_interleaved_ref(audio_buf);
                 let samples = sbuf.samples(); // interleaved f32
-                out.extend_from_slice(samples);
+                let chunk = Arc::new(samples.to_vec());
+                total_frames += (samples.len() / chs as usize) as u64;
+
+                // push to playback queue
+                let _ = pcm_tx.send(chunk.clone());
+                chunk_store.push(chunk);
 
                 let chan_count = chs as usize;
                 let frames = samples.len() / chan_count;
-                total_frames += frames as u64;
 
                 for f in 0..frames {
                     let base = f * chan_count;
@@ -122,6 +167,13 @@ pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
         rms_preview.push(rms);
     }
 
+    // Build contiguous PCM from chunks for future random access features.
+    let total_samples: usize = chunk_store.iter().map(|c| c.len()).sum();
+    let mut out = Vec::with_capacity(total_samples);
+    for chunk in chunk_store {
+        out.extend_from_slice(&chunk);
+    }
+
     let info = DecodedInfo {
         sample_rate: sr,
         channels: chs,
@@ -136,5 +188,7 @@ pub fn decode_with_preview(path: &Path) -> Result<(DecodedInfo, MemoryAudio)> {
         data: out,
     };
 
-    Ok((info, audio))
+    event_tx.send(LoadEvent::PreviewReady { info, audio })?;
+
+    Ok(())
 }
