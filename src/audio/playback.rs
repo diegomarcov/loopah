@@ -28,6 +28,7 @@ struct MemoryState {
     src: Arc<MemoryAudio>,
     pos_frame: f64,
     ratio: f64,
+    loop_range: Option<(f64, f64)>,
 }
 
 struct StreamState {
@@ -70,6 +71,7 @@ impl Player {
                 src: Arc::new(src),
                 pos_frame: 0.0,
                 ratio,
+                loop_range: None,
             }),
             playing: true,
             volume: 1.0,
@@ -167,7 +169,7 @@ impl Player {
             st.playing = false;
             match &mut st.mode {
                 PlaybackMode::Memory(mem) => {
-                    mem.pos_frame = 0.0;
+                    mem.reset_to_loop_start();
                 }
                 PlaybackMode::Stream(stream) => {
                     stream.pos_frame = 0.0;
@@ -184,11 +186,20 @@ impl Player {
         self.shared.lock().map(|s| s.playing).unwrap_or(false)
     }
 
-    pub fn is_streaming(&self) -> bool {
-        self.shared
-            .lock()
-            .map(|s| matches!(s.mode, PlaybackMode::Stream(_)))
-            .unwrap_or(false)
+    pub fn set_loop(&self, loop_range_secs: Option<(f64, f64)>) {
+        if let Ok(mut st) = self.shared.lock() {
+            if let PlaybackMode::Memory(mem) = &mut st.mode {
+                mem.set_loop(loop_range_secs);
+            }
+        }
+    }
+
+    pub fn set_position_seconds(&self, seconds: f64) {
+        if let Ok(mut st) = self.shared.lock() {
+            if let PlaybackMode::Memory(mem) = &mut st.mode {
+                mem.set_position_seconds(seconds);
+            }
+        }
     }
 }
 
@@ -204,6 +215,7 @@ fn process_memory(mem: &mut MemoryState, playing: bool, volume: f32, output: &mu
     let out_frames = output.len() / ch;
     let mut wrote = 0usize;
     for f in 0..out_frames {
+        mem.enforce_loop_bounds();
         let p = mem.pos_frame;
         let i0 = p.floor() as usize;
         if i0 >= total_frames.saturating_sub(1) {
@@ -217,6 +229,7 @@ fn process_memory(mem: &mut MemoryState, playing: bool, volume: f32, output: &mu
             output[f * ch + c] = (s0 + (s1 - s0) * frac) * volume;
         }
         mem.pos_frame += mem.ratio;
+        mem.enforce_loop_bounds();
         wrote += 1;
     }
     for s in &mut output[wrote * ch..] {
@@ -333,5 +346,61 @@ fn read_frame(
 fn zero_from(buf: &mut [f32], start: usize) {
     for s in &mut buf[start..] {
         *s = 0.0;
+    }
+}
+
+impl MemoryState {
+    fn set_loop(&mut self, range_secs: Option<(f64, f64)>) {
+        if let Some((start, end)) = range_secs {
+            let sr = self.src.sample_rate as f64;
+            let mut s = (start * sr).floor();
+            let mut e = (end * sr).ceil();
+            if e <= s {
+                self.loop_range = None;
+                return;
+            }
+            let max_frame = (self.src.frames as f64 - 1.0).max(0.0);
+            s = s.clamp(0.0, max_frame);
+            e = e.clamp(s + 1.0, self.src.frames as f64);
+            if e - s < 1.0 {
+                self.loop_range = None;
+                return;
+            }
+            self.loop_range = Some((s, e));
+            self.enforce_loop_bounds();
+        } else {
+            self.loop_range = None;
+        }
+    }
+
+    fn set_position_seconds(&mut self, seconds: f64) {
+        let sr = self.src.sample_rate as f64;
+        let frame = (seconds * sr).clamp(0.0, (self.src.frames as f64 - 1.0).max(0.0));
+        self.pos_frame = frame;
+        self.enforce_loop_bounds();
+    }
+
+    fn enforce_loop_bounds(&mut self) {
+        if let Some((start, end)) = self.loop_range {
+            let span = (end - start).max(1.0);
+            if self.pos_frame < start {
+                self.pos_frame = start;
+            } else if self.pos_frame >= end {
+                let offset = (self.pos_frame - start).rem_euclid(span);
+                self.pos_frame = start + offset;
+            }
+        } else {
+            self.pos_frame = self
+                .pos_frame
+                .clamp(0.0, (self.src.frames as f64 - 1.0).max(0.0));
+        }
+    }
+
+    fn reset_to_loop_start(&mut self) {
+        if let Some((start, _)) = self.loop_range {
+            self.pos_frame = start;
+        } else {
+            self.pos_frame = 0.0;
+        }
     }
 }

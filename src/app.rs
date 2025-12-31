@@ -13,6 +13,12 @@ struct LoopRange {
     end: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MarkerHandle {
+    Start,
+    End,
+}
+
 impl LoopRange {
     fn ordered(a: f64, b: f64) -> Self {
         if a <= b {
@@ -48,6 +54,7 @@ pub struct LoopahApp {
     load_error: Option<String>,
     loop_range: Option<LoopRange>,
     loop_drag_anchor: Option<f64>,
+    marker_drag: Option<MarkerHandle>,
 
     // Waveform view state (seconds):
     view_x_min: f64,
@@ -68,6 +75,7 @@ impl LoopahApp {
             load_error: None,
             loop_range: None,
             loop_drag_anchor: None,
+            marker_drag: None,
             view_x_min: 0.0,
             view_x_max: 10.0, // temporary; reset on file open
         }
@@ -84,6 +92,7 @@ impl LoopahApp {
         self.load_error = None;
         self.loop_range = None;
         self.loop_drag_anchor = None;
+        self.marker_drag = None;
         self.view_x_min = 0.0;
         self.view_x_max = 10.0;
     }
@@ -117,17 +126,30 @@ impl LoopahApp {
                         let duration = file_duration_seconds(self.info.as_ref().unwrap());
                         self.loop_range = Some(LoopRange::ordered(0.0, duration));
                         self.loop_drag_anchor = None;
-                        let should_replace = self
+                        self.marker_drag = None;
+                        let prev_playing = self
                             .player
                             .as_ref()
-                            .map(|p| !p.is_streaming() || !p.is_playing())
-                            .unwrap_or(true);
-                        if should_replace {
-                            match Player::from_memory(audio) {
-                                Ok(p) => self.player = Some(p),
-                                Err(e) => {
-                                    eprintln!("Audio output init failed: {e:#}");
+                            .map(|p| p.is_playing())
+                            .unwrap_or(false);
+                        let prev_pos = self
+                            .player
+                            .as_ref()
+                            .map(|p| p.position_seconds())
+                            .unwrap_or(0.0);
+                        match Player::from_memory(audio) {
+                            Ok(p) => {
+                                self.player = Some(p);
+                                self.sync_player_loop();
+                                if let Some(player) = &self.player {
+                                    player.set_position_seconds(prev_pos);
+                                    if !prev_playing {
+                                        player.pause();
+                                    }
                                 }
+                            }
+                            Err(e) => {
+                                eprintln!("Audio output init failed: {e:#}");
                             }
                         }
                         drop_events = true;
@@ -196,7 +218,8 @@ impl eframe::App for LoopahApp {
             if let (Some(info), Some(loop_range)) = (self.info.as_ref(), self.loop_range) {
                 let duration = file_duration_seconds(info);
                 let frame = 1.0 / info.sample_rate as f64;
-                let ten_frames = frame * 10.0;
+                let one_sec = 1.0;
+                let ten_secs = 10.0;
                 let mut start = loop_range.start;
                 let mut end = loop_range.end;
                 let mut changed = false;
@@ -214,20 +237,20 @@ impl eframe::App for LoopahApp {
                                 .max_decimals(3),
                         )
                         .changed();
-                    if ui.small_button("−1f").clicked() {
-                        start -= frame;
+                    if ui.small_button("−1s").clicked() {
+                        start -= one_sec;
                         changed = true;
                     }
-                    if ui.small_button("+1f").clicked() {
-                        start += frame;
+                    if ui.small_button("+1s").clicked() {
+                        start += one_sec;
                         changed = true;
                     }
-                    if ui.small_button("−10f").clicked() {
-                        start -= ten_frames;
+                    if ui.small_button("−10s").clicked() {
+                        start -= ten_secs;
                         changed = true;
                     }
-                    if ui.small_button("+10f").clicked() {
-                        start += ten_frames;
+                    if ui.small_button("+10s").clicked() {
+                        start += ten_secs;
                         changed = true;
                     }
 
@@ -243,20 +266,20 @@ impl eframe::App for LoopahApp {
                                 .max_decimals(3),
                         )
                         .changed();
-                    if ui.small_button("−1f").clicked() {
-                        end -= frame;
+                    if ui.small_button("−1s").clicked() {
+                        end -= one_sec;
                         changed = true;
                     }
-                    if ui.small_button("+1f").clicked() {
-                        end += frame;
+                    if ui.small_button("+1s").clicked() {
+                        end += one_sec;
                         changed = true;
                     }
-                    if ui.small_button("−10f").clicked() {
-                        end -= ten_frames;
+                    if ui.small_button("−10s").clicked() {
+                        end -= ten_secs;
                         changed = true;
                     }
-                    if ui.small_button("+10f").clicked() {
-                        end += ten_frames;
+                    if ui.small_button("+10s").clicked() {
+                        end += ten_secs;
                         changed = true;
                     }
 
@@ -266,13 +289,15 @@ impl eframe::App for LoopahApp {
 
                 ui.label(
                     egui::RichText::new(
-                        "Tip: hold Shift and drag on the waveform to reset A/B quickly.",
+                        "TIP: Hold Shift and drag on the waveform to set A/B quickly.",
                     )
-                    .small(),
+                    .size(15.0)
+                    .strong(),
                 );
 
                 if changed {
                     self.loop_range = Some(LoopRange::ordered(start, end).clamp(duration));
+                    self.sync_player_loop();
                 }
             } else {
                 ui.label("Load a file to edit loop points.");
@@ -322,31 +347,77 @@ impl eframe::App for LoopahApp {
 
 impl LoopahApp {
     fn handle_waveform_interaction(&mut self, duration: f64, result: &WaveformResult) {
-        if !result.shift_down {
+        if result.shift_down {
+            self.marker_drag = None;
+            if result.drag_started {
+                if let Some(sec) = result.pointer_seconds {
+                    self.loop_drag_anchor = Some(sec);
+                    self.loop_range = Some(LoopRange::ordered(sec, sec).clamp(duration));
+                    self.sync_player_loop();
+                }
+            }
+            if let (Some(anchor), Some(current)) = (self.loop_drag_anchor, result.pointer_seconds) {
+                if result.drag_active {
+                    self.loop_range = Some(LoopRange::ordered(anchor, current).clamp(duration));
+                    self.sync_player_loop();
+                }
+            }
             if result.drag_released {
                 self.loop_drag_anchor = None;
             }
             return;
         }
+
+        // Non-shift interactions: drag individual markers if near pointer.
         if result.drag_started {
-            if let Some(sec) = result.pointer_seconds {
-                self.loop_drag_anchor = Some(sec);
-                self.loop_range = Some(LoopRange::ordered(sec, sec).clamp(duration));
-            }
-        }
-        if let (Some(anchor), Some(current)) = (self.loop_drag_anchor, result.pointer_seconds) {
-            if result.drag_active {
-                self.loop_range = Some(LoopRange::ordered(anchor, current).clamp(duration));
-            }
-        }
-        if result.drag_released {
             self.loop_drag_anchor = None;
+            if let (Some(range), Some(pointer)) = (self.loop_range, result.pointer_seconds) {
+                let threshold = (duration * 0.01).max(0.1);
+                let dist_start = (pointer - range.start).abs();
+                let dist_end = (pointer - range.end).abs();
+                if dist_start <= dist_end && dist_start <= threshold {
+                    self.marker_drag = Some(MarkerHandle::Start);
+                } else if dist_end < dist_start && dist_end <= threshold {
+                    self.marker_drag = Some(MarkerHandle::End);
+                } else if dist_end == dist_start && dist_start <= threshold {
+                    self.marker_drag = Some(MarkerHandle::End);
+                } else {
+                    self.marker_drag = None;
+                }
+            }
+        }
+
+        if let (Some(handle), Some(pointer)) = (self.marker_drag, result.pointer_seconds) {
+            if result.drag_active || result.drag_released {
+                if let Some(mut range) = self.loop_range {
+                    match handle {
+                        MarkerHandle::Start => range.start = pointer,
+                        MarkerHandle::End => range.end = pointer,
+                    }
+                    self.loop_range =
+                        Some(LoopRange::ordered(range.start, range.end).clamp(duration));
+                    self.sync_player_loop();
+                }
+            }
+        }
+
+        if result.drag_released {
+            self.marker_drag = None;
         }
     }
 }
 
 fn file_duration_seconds(info: &DecodedInfo) -> f64 {
     info.total_frames as f64 / info.sample_rate as f64
+}
+
+impl LoopahApp {
+    fn sync_player_loop(&self) {
+        if let Some(player) = &self.player {
+            let secs = self.loop_range.map(|r| (r.start, r.end));
+            player.set_loop(secs);
+        }
+    }
 }
 
 fn format_time(secs: f64) -> String {
