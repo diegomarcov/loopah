@@ -10,6 +10,10 @@ pub struct LoopahApp {
     info: Option<DecodedInfo>,
     mem_audio: Option<MemoryAudio>,
     player: Option<Player>,
+
+    // Waveform view state (seconds):
+    view_x_min: f64,
+    view_x_max: f64,
 }
 
 impl LoopahApp {
@@ -19,6 +23,8 @@ impl LoopahApp {
             info: None,
             mem_audio: None,
             player: None,
+            view_x_min: 0.0,
+            view_x_max: 10.0, // temporary; reset on file open
         }
     }
 }
@@ -36,7 +42,12 @@ impl eframe::App for LoopahApp {
                         self.selected_file = Some(path.clone());
                         // Decode once to get info + preview.
                         match probe_and_preview(&path) {
-                            Ok(info) => self.info = Some(info),
+                            Ok(info) => {
+                                self.view_x_min = 0.0;
+                                self.view_x_max =
+                                    (info.total_frames as f64 / info.sample_rate as f64).max(1.0);
+                                self.info = Some(info);
+                            }
                             Err(err) => {
                                 self.info = None;
                                 eprintln!("Failed to decode: {err:#}");
@@ -99,7 +110,10 @@ impl eframe::App for LoopahApp {
                     info.rms_preview.len()
                 ));
                 ui.add_space(6.0);
-                draw_waveform(ui, info);
+                let playhead = self.player.as_ref().map(|p| p.position_seconds());
+                let res = draw_waveform(ui, info, self.view_x_min, self.view_x_max, playhead);
+                self.view_x_min = res.x_min;
+                self.view_x_max = res.x_max;
             } else {
                 ui.label("Open an audio file to see its waveform.");
             }

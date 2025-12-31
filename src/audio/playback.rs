@@ -21,6 +21,13 @@ struct State {
 }
 
 impl Player {
+    pub fn position_seconds(&self) -> f64 {
+        if let Ok(st) = self.shared.lock() {
+            st.pos_frame / (st.src.sample_rate as f64)
+        } else {
+            0.0
+        }
+    }
     pub fn new(src: MemoryAudio) -> Result<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device().context("no output device")?;
