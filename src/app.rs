@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::path::PathBuf;
 
-use crate::audio::decode::{DecodedInfo, MemoryAudio, decode_all_interleaved, probe_and_preview};
+use crate::audio::decode::{DecodedInfo, MemoryAudio, decode_with_preview};
 use crate::audio::playback::Player;
 use crate::ui::waveform::draw_waveform;
 
@@ -40,23 +40,13 @@ impl eframe::App for LoopahApp {
 
                     if let Some(path) = picked {
                         self.selected_file = Some(path.clone());
-                        // Decode once to get info + preview.
-                        match probe_and_preview(&path) {
-                            Ok(info) => {
+
+                        match decode_with_preview(&path) {
+                            Ok((info, mem)) => {
                                 self.view_x_min = 0.0;
                                 self.view_x_max =
                                     (info.total_frames as f64 / info.sample_rate as f64).max(1.0);
                                 self.info = Some(info);
-                            }
-                            Err(err) => {
-                                self.info = None;
-                                eprintln!("Failed to decode: {err:#}");
-                            }
-                        }
-
-                        // Decode full PCM for playback
-                        match decode_all_interleaved(&path) {
-                            Ok(mem) => {
                                 self.mem_audio = Some(mem.clone());
                                 match Player::new(mem) {
                                     Ok(p) => self.player = Some(p),
@@ -66,9 +56,11 @@ impl eframe::App for LoopahApp {
                                     }
                                 }
                             }
-                            Err(e) => {
+                            Err(err) => {
+                                self.info = None;
                                 self.mem_audio = None;
-                                eprintln!("Full decode failed: {e:#}");
+                                self.player = None;
+                                eprintln!("Failed to decode: {err:#}");
                             }
                         }
                     }
